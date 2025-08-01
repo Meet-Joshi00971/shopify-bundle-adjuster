@@ -1,31 +1,32 @@
-require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
 
 const app = express();
-const PORT = process.env.PORT || 10000;
+const PORT = 10000;
 
-app.use(bodyParser.json());
-
+// Hardcoded Shopify credentials
+const SHOPIFY_STORE = 'snuslyf.myshopify.com'; // ← Replace with your store URL
+const SHOPIFY_ADMIN_API_ACCESS_TOKEN = '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'; // ← Replace with your admin token
 const SHOPIFY_API_VERSION = '2024-04';
-const SHOPIFY_STORE = snuslyf.myshopify.com;
-const SHOPIFY_ADMIN_API = `https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_API_VERSION}`;
-const ADMIN_TOKEN = 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;
 
+const SHOPIFY_ADMIN_API = `https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_API_VERSION}`;
+
+// Generic Shopify GraphQL POST request
 const shopifyRequest = async (query, variables = {}) => {
   const res = await axios.post(`${SHOPIFY_ADMIN_API}/graphql.json`, {
     query,
     variables
   }, {
     headers: {
-      'X-Shopify-Access-Token': ADMIN_TOKEN,
+      'X-Shopify-Access-Token': SHOPIFY_ADMIN_API_ACCESS_TOKEN,
       'Content-Type': 'application/json'
     }
   });
   return res.data;
 };
 
+// Fetch full order including _BundleComponents
 const getOrderDetails = async (orderId) => {
   const query = `
     query GetOrder($id: ID!) {
@@ -38,12 +39,6 @@ const getOrderDetails = async (orderId) => {
               properties {
                 name
                 value
-              }
-              variant {
-                id
-                inventoryItem {
-                  id
-                }
               }
             }
           }
@@ -65,6 +60,7 @@ const getOrderDetails = async (orderId) => {
   return response.data?.order;
 };
 
+// Send inventory adjust mutation
 const adjustInventory = async (changes) => {
   const mutation = `
     mutation AdjustInventory($input: InventoryAdjustQuantitiesInput!) {
@@ -83,7 +79,7 @@ const adjustInventory = async (changes) => {
 
   const input = {
     reason: "correction",
-    referenceDocumentUri: "https://yourdomain.com/ledger",
+    referenceDocumentUri: "https://yourdomain.com/ledger", // Optional but good to have
     changes: changes
   };
 
@@ -91,6 +87,8 @@ const adjustInventory = async (changes) => {
   return response;
 };
 
+// Main endpoint
+app.use(bodyParser.json());
 app.post('/bundle-adjust', async (req, res) => {
   try {
     const rawOrderId = req.body.order_id;
@@ -101,7 +99,6 @@ app.post('/bundle-adjust', async (req, res) => {
     if (!order) throw new Error("Order not found.");
 
     const lineItems = order.lineItems.edges.map(edge => edge.node);
-
     const bundleItems = lineItems
       .map(item => {
         const bundleProp = item.properties.find(p => p.name === '_BundleComponents');
