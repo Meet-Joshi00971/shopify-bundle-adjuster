@@ -5,7 +5,7 @@ const bodyParser = require("body-parser");
 const app = express();
 app.use(bodyParser.json());
 
-// 🚨 SET THESE IN RENDER ENV VARIABLES
+// 🌐 ENV VARIABLES in Render dashboard
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE; // e.g. "your-store.myshopify.com"
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN;     // e.g. "shpat_abc123..."
 
@@ -14,11 +14,10 @@ app.post("/bundle-adjust", async (req, res) => {
     const fullGid = req.body.order_id;
     if (!fullGid) return res.status(400).send("Missing order_id");
 
-    // ✅ Extract plain numeric ID from Shopify GID
     const orderId = fullGid.split("/").pop();
     console.log(`[Server] Received order ID: ${orderId}`);
 
-    // 🛒 Step 1: Fetch full order with line item properties
+    // 🛒 Step 1: Get full order
     const orderRes = await axios.get(
       `https://${SHOPIFY_STORE}/admin/api/2023-10/orders/${orderId}.json`,
       {
@@ -28,32 +27,51 @@ app.post("/bundle-adjust", async (req, res) => {
       }
     );
 
-    const lineItems = orderRes.data.order.line_items;
+    const order = orderRes.data.order;
+    const lineItems = order.line_items;
+
+    // 🧭 Step 2: Detect locationId
+    const locationsRes = await axios.get(
+      `https://${SHOPIFY_STORE}/admin/api/2023-10/locations.json`,
+      {
+        headers: {
+          "X-Shopify-Access-Token": ADMIN_TOKEN,
+        },
+      }
+    );
+
+    const primaryLocation = locationsRes.data.locations[0];
+    if (!primaryLocation) throw new Error("No location found in store.");
+
+    const locationId = `gid://shopify/Location/${primaryLocation.id}`;
+    console.log(`[Location] Using location ID: ${locationId}`);
+
+    // 🧩 Step 3: Build inventory adjustments
     const adjustments = [];
 
-    // 🧩 Step 2: Parse `_BundleComponents` from line item properties
     for (const item of lineItems) {
       const props = item.properties || [];
       const bundleProp = props.find((p) => p.name === "_BundleComponents");
 
       if (bundleProp) {
         console.log(`[Bundle] Found _BundleComponents: ${bundleProp.value}`);
-
         const components = bundleProp.value.split(", ");
         for (const component of components) {
           const [inventoryItemIdRaw, quantityRaw] = component.split("|").map((v) => v.trim());
-
           if (!inventoryItemIdRaw || !quantityRaw) continue;
+
+          const deltaQty = -parseInt(quantityRaw, 10);
 
           adjustments.push({
             inventoryItemId: `gid://shopify/InventoryItem/${inventoryItemIdRaw}`,
-            availableDelta: -parseInt(quantityRaw, 10),
+            delta: deltaQty,
+            locationId: locationId,
           });
         }
       }
     }
 
-    // 🚀 Step 3: Send inventoryAdjustQuantities mutation
+    // 🛠️ Step 4: Adjust inventory
     if (adjustments.length > 0) {
       const mutation = `
         mutation inventoryAdjustQuantities($input: InventoryAdjustQuantitiesInput!) {
@@ -92,24 +110,21 @@ app.post("/bundle-adjust", async (req, res) => {
         }
       );
 
-      // 🪵 DEBUG FULL GRAPHQL RESPONSE
+      // 🧪 LOG GRAPHQL RESPONSE
       console.log("[DEBUG] GraphQL raw response:", JSON.stringify(gqlRes.data, null, 2));
 
-      // 🧯 HANDLE GRAPHQL ERRORS
       if (gqlRes.data.errors) {
         console.error("[GraphQL top-level errors]", JSON.stringify(gqlRes.data.errors, null, 2));
         return res.status(500).send("GraphQL top-level error");
       }
 
       const result = gqlRes.data.data;
-
       if (!result || !result.inventoryAdjustQuantities) {
         console.error("[GraphQL missing inventoryAdjustQuantities]", JSON.stringify(result, null, 2));
         return res.status(500).send("Missing inventoryAdjustQuantities result");
       }
 
       const userErrors = result.inventoryAdjustQuantities.userErrors;
-
       if (userErrors && userErrors.length > 0) {
         console.error("[GraphQL userErrors]", JSON.stringify(userErrors, null, 2));
         return res.status(500).send("Inventory adjustment failed (userErrors)");
@@ -118,7 +133,7 @@ app.post("/bundle-adjust", async (req, res) => {
       console.log("[✅ SUCCESS] Inventory adjusted successfully!");
       return res.status(200).send("Inventory adjusted");
     } else {
-      console.log("[ℹ️] No bundle components found in this order.");
+      console.log("[ℹ️] No bundle components found.");
       return res.status(200).send("No bundle components found");
     }
   } catch (err) {
