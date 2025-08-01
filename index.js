@@ -3,30 +3,47 @@ const bodyParser = require('body-parser');
 const axios = require('axios');
 
 const app = express();
-const PORT = 10000;
+const PORT = process.env.PORT || 10000;
 
-// Hardcoded Shopify credentials
-const SHOPIFY_STORE = 'snuslyf.myshopify.com'; // ← Replace with your store URL
-const SHOPIFY_ADMIN_API_ACCESS_TOKEN = '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'; // ← Replace with your admin token
-const SHOPIFY_API_VERSION = '2024-04';
+// 🔧 Set your credentials directly here:
+const SHOPIFY_ACCESS_TOKEN = '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';
+const SHOPIFY_STORE_URL = 'snuslyf.myshopify.com';
 
-const SHOPIFY_ADMIN_API = `https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_API_VERSION}`;
-
-// Generic Shopify GraphQL POST request
+// ===============================
+// 🧠 Shopify GraphQL Request Helper
+// ===============================
 const shopifyRequest = async (query, variables = {}) => {
-  const res = await axios.post(`${SHOPIFY_ADMIN_API}/graphql.json`, {
-    query,
-    variables
-  }, {
-    headers: {
-      'X-Shopify-Access-Token': SHOPIFY_ADMIN_API_ACCESS_TOKEN,
-      'Content-Type': 'application/json'
+  const url = `https://${SHOPIFY_STORE_URL}/admin/api/2024-07/graphql.json`;
+
+  try {
+    const response = await axios.post(
+      url,
+      { query, variables },
+      {
+        headers: {
+          'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+
+    if (response.data.errors) {
+      console.error('[GraphQL top-level errors]', response.data.errors);
     }
-  });
-  return res.data;
+    if (response.data.data?.inventoryAdjustQuantities?.userErrors?.length) {
+      console.error('[GraphQL user errors]', response.data.data.inventoryAdjustQuantities.userErrors);
+    }
+
+    return response.data;
+  } catch (error) {
+    console.error('[❌ ERROR]', error.message);
+    throw error;
+  }
 };
 
-// Fetch full order including _BundleComponents
+// ===============================
+// 🔍 Get Order Details
+// ===============================
 const getOrderDetails = async (orderId) => {
   const query = `
     query GetOrder($id: ID!) {
@@ -55,19 +72,22 @@ const getOrderDetails = async (orderId) => {
       }
     }
   `;
-  const variables = { id: orderId };
-  const response = await shopifyRequest(query, variables);
+
+  // ⚠️ Encode GID to base64
+  const base64OrderId = Buffer.from(orderId).toString('base64');
+  const response = await shopifyRequest(query, { id: base64OrderId });
   return response.data?.order;
 };
 
-// Send inventory adjust mutation
-const adjustInventory = async (changes) => {
+// ===============================
+// 🧮 Adjust Inventory Mutation
+// ===============================
+const adjustInventory = async (locationId, adjustments) => {
   const mutation = `
     mutation AdjustInventory($input: InventoryAdjustQuantitiesInput!) {
       inventoryAdjustQuantities(input: $input) {
         inventoryAdjustmentGroup {
           createdAt
-          reason
         }
         userErrors {
           field
@@ -78,79 +98,79 @@ const adjustInventory = async (changes) => {
   `;
 
   const input = {
+    name: "available", // ✅ Must be one of Shopify's accepted values
     reason: "correction",
-    referenceDocumentUri: "https://yourdomain.com/ledger", // Optional but good to have
-    changes: changes
+    changes: adjustments.map(adj => ({
+      inventoryItemId: `gid://shopify/InventoryItem/${adj.inventoryItemId}`,
+      delta: -adj.quantity,
+      locationId: locationId,
+      ledgerDocumentUri: "https://yourdomain.com/ledger"
+    }))
   };
 
   const response = await shopifyRequest(mutation, { input });
   return response;
 };
 
-// Main endpoint
+// ===============================
+// 🚀 Handle Bundle Inventory Deduction
+// ===============================
 app.use(bodyParser.json());
+
 app.post('/bundle-adjust', async (req, res) => {
   try {
     const rawOrderId = req.body.order_id;
+    console.log('[Server] Received order ID:', rawOrderId);
+
     const orderId = rawOrderId.startsWith('gid://') ? rawOrderId : `gid://shopify/Order/${rawOrderId}`;
-    console.log(`[Server] Received order ID: ${orderId}`);
-
     const order = await getOrderDetails(orderId);
-    if (!order) throw new Error("Order not found.");
 
-    const lineItems = order.lineItems.edges.map(edge => edge.node);
-    const bundleItems = lineItems
-      .map(item => {
-        const bundleProp = item.properties.find(p => p.name === '_BundleComponents');
-        return bundleProp ? { quantity: item.quantity, components: bundleProp.value } : null;
-      })
-      .filter(Boolean);
-
-    if (bundleItems.length === 0) {
-      console.log("[Bundle] No bundle components found.");
-      return res.status(200).send("No bundles to adjust.");
+    if (!order) {
+      console.error('[❌ ERROR] Order not found.');
+      return res.status(404).send('Order not found');
     }
 
     const locationId = order.fulfillments?.edges?.[0]?.node?.location?.id;
-    if (!locationId) throw new Error("Location ID not found.");
-    console.log(`[Location] Using location ID: ${locationId}`);
+    if (!locationId) {
+      console.error('[❌ ERROR] Location ID not found.');
+      return res.status(400).send('Location not found');
+    }
 
-    const changes = [];
+    console.log('[Location] Using location ID:', locationId);
 
-    for (const bundle of bundleItems) {
-      console.log(`[Bundle] Found _BundleComponents: ${bundle.components}`);
+    const adjustments = [];
 
-      const components = bundle.components.split(',').map(comp => {
-        const [itemId, qty] = comp.trim().split('|').map(s => s.trim());
-        return { itemId, qty: parseInt(qty) };
-      });
+    for (const edge of order.lineItems.edges) {
+      const { quantity, properties } = edge.node;
 
-      for (const comp of components) {
-        const inventoryItemId = `gid://shopify/InventoryItem/${comp.itemId}`;
-        changes.push({
-          inventoryItemId,
-          delta: -comp.qty * bundle.quantity,
-          locationId
+      const bundleProp = properties?.find(p => p.name === '_BundleComponents');
+      if (!bundleProp || !bundleProp.value) continue;
+
+      const components = bundleProp.value.split(',').map(x => x.trim());
+      for (const component of components) {
+        const [itemId, qty] = component.split('|').map(x => x.trim());
+        adjustments.push({
+          inventoryItemId: itemId,
+          quantity: parseInt(qty) * quantity
         });
       }
+
+      console.log('[Bundle] Found _BundleComponents:', bundleProp.value);
     }
 
-    const response = await adjustInventory(changes);
-    console.log('[DEBUG] GraphQL raw response:', JSON.stringify(response, null, 2));
-
-    const userErrors = response.data?.inventoryAdjustQuantities?.userErrors || [];
-    if (userErrors.length > 0) {
-      console.error('[GraphQL user errors]', userErrors);
-      return res.status(500).json({ errors: userErrors });
+    if (adjustments.length === 0) {
+      console.log('[Server] No bundle components to adjust.');
+      return res.status(200).send('No bundles found.');
     }
 
-    return res.status(200).send('Inventory adjusted successfully.');
+    const response = await adjustInventory(locationId, adjustments);
+    return res.status(200).send('Inventory adjusted.');
   } catch (err) {
-    console.error('[❌ ERROR]', err.message || err);
-    return res.status(500).send('Server error');
+    console.error('[❌ ERROR]', err);
+    res.status(500).send('Error adjusting inventory');
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`[Server] Listening on port ${PORT}`);
+  console.log(`[✅ Server] Running on port ${PORT}`);
 });
