@@ -5,13 +5,13 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// 🔧 Set your credentials directly here:
+// 🔧 Your credentials:
 const SHOPIFY_ACCESS_TOKEN = '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';
 const SHOPIFY_STORE_URL = 'snuslyf.myshopify.com';
 
-// ===============================
-// 🧠 Shopify GraphQL Request Helper
-// ===============================
+// =============================
+// 📡 Shopify GraphQL Request
+// =============================
 const shopifyRequest = async (query, variables = {}) => {
   const url = `https://${SHOPIFY_STORE_URL}/admin/api/2024-07/graphql.json`;
 
@@ -41,47 +41,40 @@ const shopifyRequest = async (query, variables = {}) => {
   }
 };
 
-// ===============================
-// 🔍 Get Order Details
-// ===============================
+// =============================
+// 🔍 Get Order Info
+// =============================
 const getOrderDetails = async (orderId) => {
   const query = `
     query GetOrder($id: ID!) {
       order(id: $id) {
         lineItems(first: 50) {
-          edges {
-            node {
-              name
-              quantity
-              properties {
-                name
-                value
-              }
+          nodes {
+            name
+            quantity
+            customAttributes {
+              key
+              value
             }
           }
         }
-        fulfillments(first: 1) {
-          edges {
-            node {
-              location {
-                id
-              }
-            }
+        fulfillments {
+          location {
+            id
           }
         }
       }
     }
   `;
 
-  // ⚠️ Encode GID to base64
   const base64OrderId = Buffer.from(orderId).toString('base64');
   const response = await shopifyRequest(query, { id: base64OrderId });
   return response.data?.order;
 };
 
-// ===============================
-// 🧮 Adjust Inventory Mutation
-// ===============================
+// =============================
+// 📉 Adjust Inventory
+// =============================
 const adjustInventory = async (locationId, adjustments) => {
   const mutation = `
     mutation AdjustInventory($input: InventoryAdjustQuantitiesInput!) {
@@ -98,23 +91,22 @@ const adjustInventory = async (locationId, adjustments) => {
   `;
 
   const input = {
-    name: "available", // ✅ Must be one of Shopify's accepted values
+    name: "available",
     reason: "correction",
     changes: adjustments.map(adj => ({
       inventoryItemId: `gid://shopify/InventoryItem/${adj.inventoryItemId}`,
       delta: -adj.quantity,
-      locationId: locationId,
+      locationId,
       ledgerDocumentUri: "https://yourdomain.com/ledger"
     }))
   };
 
-  const response = await shopifyRequest(mutation, { input });
-  return response;
+  return await shopifyRequest(mutation, { input });
 };
 
-// ===============================
-// 🚀 Handle Bundle Inventory Deduction
-// ===============================
+// =============================
+// 📦 Bundle Adjust Endpoint
+// =============================
 app.use(bodyParser.json());
 
 app.post('/bundle-adjust', async (req, res) => {
@@ -130,7 +122,7 @@ app.post('/bundle-adjust', async (req, res) => {
       return res.status(404).send('Order not found');
     }
 
-    const locationId = order.fulfillments?.edges?.[0]?.node?.location?.id;
+    const locationId = order.fulfillments?.[0]?.location?.id;
     if (!locationId) {
       console.error('[❌ ERROR] Location ID not found.');
       return res.status(400).send('Location not found');
@@ -140,10 +132,10 @@ app.post('/bundle-adjust', async (req, res) => {
 
     const adjustments = [];
 
-    for (const edge of order.lineItems.edges) {
-      const { quantity, properties } = edge.node;
+    for (const item of order.lineItems.nodes) {
+      const { quantity, customAttributes } = item;
 
-      const bundleProp = properties?.find(p => p.name === '_BundleComponents');
+      const bundleProp = customAttributes?.find(p => p.key === '_BundleComponents');
       if (!bundleProp || !bundleProp.value) continue;
 
       const components = bundleProp.value.split(',').map(x => x.trim());
