@@ -3,8 +3,8 @@ const axios = require("axios");
 const app = express();
 app.use(express.json());
 
-const ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
-const SHOPIFY_STORE = process.env.SHOPIFY_STORE_DOMAIN;
+const ADMIN_TOKEN = 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;
+const SHOPIFY_STORE = snuslyf.myshopify.com;
 const LOCATION_ID = "gid://shopify/Location/108654461258";
 
 app.post("/bundle-adjust", async (req, res) => {
